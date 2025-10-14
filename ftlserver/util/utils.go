@@ -10,13 +10,14 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
-	"github.com/PaienNate/goutil/syncmap"
 	"math/big"
 	"net"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/PaienNate/pineutil/syncmap"
 )
 
 // CertificateStore 证书缓存接口

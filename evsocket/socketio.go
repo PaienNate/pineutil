@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/url"
 	"sync"
@@ -66,41 +65,6 @@ var (
 	ErrorUUIDIsEmpty     = errors.New("SingleMode with UUID empty is prohibited")
 	// ErrorClosedByOperator The connection is closed as there has a new connection
 	ErrorClosedError = errors.New("UUID already exists in the available connections pool")
-
-	// 新增：详细错误类型
-	ErrSessionClosed      = errors.New("websocket session is closed")
-	ErrMessageBufferFull  = errors.New("message buffer is full")
-	ErrWriteTimeout       = errors.New("write operation timeout")
-	ErrReadTimeout        = errors.New("read operation timeout")
-	ErrInvalidMessageType = errors.New("invalid message type")
-	ErrConnectionLost     = errors.New("websocket connection lost")
-)
-
-// SocketError 错误详情结构
-type SocketError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-	UUID    string `json:"uuid,omitempty"`
-	Cause   error  `json:"-"`
-}
-
-func (e *SocketError) Error() string {
-	if e.Cause != nil {
-		return fmt.Sprintf("[%d] %s: %v", e.Code, e.Message, e.Cause)
-	}
-	return fmt.Sprintf("[%d] %s", e.Code, e.Message)
-}
-
-// 错误代码常量
-const (
-	ErrCodeConnectionClosed = 1001
-	ErrCodeBufferFull       = 1002
-	ErrCodeTimeout          = 1003
-	ErrCodeInvalidUUID      = 1004
-	ErrCodeDuplicateUUID    = 1005
-	ErrCodeSessionClosed    = 1006
-	ErrCodeInvalidMessage   = 1007
-	ErrCodeConnectionLost   = 1008
 )
 
 var (
@@ -113,49 +77,6 @@ var (
 	ReadTimeout = 10 * time.Millisecond
 )
 
-// ServerOptions 服务端配置结构体（与现有 ConnectionOptions 保持一致的设计风格）
-type ServerOptions struct {
-	// 基础配置
-	WriteWait         time.Duration `json:"write_wait"`
-	PongWait          time.Duration `json:"pong_wait"`
-	PingPeriod        time.Duration `json:"ping_period"`
-	MaxMessageSize    int64         `json:"max_message_size"`
-	MessageBufferSize int           `json:"message_buffer_size"`
-
-	// 并发与互斥控制
-	ConcurrentMessageHandling bool `json:"concurrent_message_handling"`
-	EnableMutexGuard          bool `json:"enable_mutex_guard"`
-
-	// 重试与超时
-	MaxSendRetry     int           `json:"max_send_retry"`
-	RetrySendTimeout time.Duration `json:"retry_send_timeout"`
-	ReadTimeout      time.Duration `json:"read_timeout"`
-
-	// 错误与日志
-	EnableDetailedErrors bool `json:"enable_detailed_errors"`
-	ErrorBufferSize      int  `json:"error_buffer_size"`
-	EnableLogging        bool `json:"enable_logging"`
-}
-
-// DefaultServerOptions 默认服务端配置函数
-func DefaultServerOptions() *ServerOptions {
-	return &ServerOptions{
-		WriteWait:                 10 * time.Second,
-		PongWait:                  PongTimeout,
-		PingPeriod:                54 * time.Second,
-		MaxMessageSize:            512,
-		MessageBufferSize:         256,
-		ConcurrentMessageHandling: false,
-		EnableMutexGuard:          false,
-		MaxSendRetry:              MaxSendRetry,
-		RetrySendTimeout:          RetrySendTimeout,
-		ReadTimeout:               ReadTimeout,
-		EnableDetailedErrors:      false,
-		ErrorBufferSize:           100,
-		EnableLogging:             false,
-	}
-}
-
 // Raw form of websocket message
 type message struct {
 	// Message type
@@ -164,72 +85,6 @@ type message struct {
 	data []byte
 	// Message send retries when error
 	retries int
-
-	// 新增：过滤器函数（可选）
-	filter func(ws) bool `json:"-"`
-
-	// 新增：目标 UUID 列表（与过滤器互斥）
-	targetUUIDs []string `json:"target_uuids,omitempty"`
-}
-
-// FilterFunc 定义过滤器函数类型
-type FilterFunc func(ws) bool
-
-// 预定义的常用过滤器
-var (
-	// FilterAlive 过滤活跃连接
-	FilterAlive FilterFunc = func(kws ws) bool {
-		return kws.IsAlive()
-	}
-)
-
-// FilterByAttribute 过滤具有特定属性的连接
-func FilterByAttribute(key string, value interface{}) FilterFunc {
-	return func(kws ws) bool {
-		return kws.GetAttribute(key) == value
-	}
-}
-
-// FilterExcludeUUID 排除特定 UUID
-func FilterExcludeUUID(excludeUUID string) FilterFunc {
-	return func(kws ws) bool {
-		return kws.GetUUID() != excludeUUID
-	}
-}
-
-// FilterByUUIDs 只包含指定的 UUID 列表
-func FilterByUUIDs(uuids []string) FilterFunc {
-	uuidMap := make(map[string]bool)
-	for _, uuid := range uuids {
-		uuidMap[uuid] = true
-	}
-	return func(kws ws) bool {
-		return uuidMap[kws.GetUUID()]
-	}
-}
-
-// FilterCombineAND 组合多个过滤器（AND 逻辑）
-func FilterCombineAND(filters ...FilterFunc) FilterFunc {
-	return func(kws ws) bool {
-		for _, filter := range filters {
-			if !filter(kws) {
-				return false
-			}
-		}
-		return true
-	}
-}
-
-// FilterCombineOR 组合多个过滤器（OR 逻辑）
-func FilterCombineOR(filters ...FilterFunc) FilterFunc {
-	return func(kws ws) bool {
-		for _, filter := range filters {
-			if filter(kws) {
-				return true
-			}
-		}
-		return false
-	}
 }
 
 type WebsocketWrapper struct {
@@ -251,34 +106,30 @@ type WebsocketWrapper struct {
 	// Manager
 	manager *SocketInstance
 	// ClientMode Needed
-	WebsocketDialer   *websocket.Dialer
-	URL               string
-	ConnectionOptions ConnectionOptions
-	RequestHeader     http.Header
-	ClientFlag        bool
 
-	// GoWebSocket 风格的快捷回调（可选）
+	URL string
+	ClientOptions
+	WebsocketDialer *websocket.Dialer
+	RequestHeader   http.Header
+	ClientFlag      bool
+
+	// 移植代码： GoWebSocket 风格的快捷回调
 	OnConnected     func()
 	OnDisconnected  func(err error)
 	OnConnectError  func(err error)
+	OnConnectFailed func(err error) // 当第一次尝试就失败的时候
 	OnTextMessage   func(message string)
 	OnBinaryMessage func(data []byte)
 	OnPingReceived  func(data string)
 	OnPongReceived  func(data string)
-
-	// 可选的互斥保护
-	sendMu    sync.Mutex
-	receiveMu sync.Mutex
 }
 
-// ConnectionOptions Copied from gowebsocket.
-type ConnectionOptions struct {
+// ClientOptions Copied from gowebsocket.
+type ClientOptions struct {
 	UseCompression bool
 	UseSSL         bool
 	Proxy          func(*http.Request) (*url.URL, error)
 	Subprotocols   []string
-	// 过期时间 TODO: 存疑是否可以使用
-	Timeout time.Duration
 }
 
 // EventPayload Event Payload is the object that
@@ -333,10 +184,6 @@ type SocketInstance struct {
 	listeners safeListeners
 	// 是否不允许多连接。启动后，第二个连接时，会自动踹掉
 	SingleMode atomic.Bool
-	// 当使用上述模式时，使用的UUID是什么（必填）
-	SingleModeUUID string
-	// ServerOpts 服务端配置（可选，保持向后兼容）
-	ServerOpts *ServerOptions `json:"server_options,omitempty"`
 }
 
 func NewSocketInstance() *SocketInstance {
@@ -345,61 +192,6 @@ func NewSocketInstance() *SocketInstance {
 		pool:      safePool{},
 		listeners: safeListeners{},
 	}
-}
-
-// NewSocketInstanceWithServerOptions 新增：带服务端配置的构造函数
-func NewSocketInstanceWithServerOptions(opts *ServerOptions) *SocketInstance {
-	if opts == nil {
-		opts = DefaultServerOptions()
-	}
-	return &SocketInstance{
-		pool:       safePool{},
-		listeners:  safeListeners{},
-		ServerOpts: opts,
-	}
-}
-
-// 配置获取方法（向后兼容）
-func (sm *SocketInstance) getWriteWait() time.Duration {
-	if sm.ServerOpts != nil {
-		return sm.ServerOpts.WriteWait
-	}
-	return 10 * time.Second // 默认值
-}
-
-func (sm *SocketInstance) getPongWait() time.Duration {
-	if sm.ServerOpts != nil {
-		return sm.ServerOpts.PongWait
-	}
-	return PongTimeout
-}
-
-func (sm *SocketInstance) getMaxSendRetry() int {
-	if sm.ServerOpts != nil {
-		return sm.ServerOpts.MaxSendRetry
-	}
-	return MaxSendRetry
-}
-
-func (sm *SocketInstance) isConcurrentHandlingEnabled() bool {
-	if sm.ServerOpts != nil {
-		return sm.ServerOpts.ConcurrentMessageHandling
-	}
-	return false
-}
-
-func (sm *SocketInstance) getMessageBufferSize() int {
-	if sm.ServerOpts != nil {
-		return sm.ServerOpts.MessageBufferSize
-	}
-	return 256 // 默认值
-}
-
-func (sm *SocketInstance) isDetailedErrorsEnabled() bool {
-	if sm.ServerOpts != nil {
-		return sm.ServerOpts.EnableDetailedErrors
-	}
-	return false
 }
 
 // EmitToList Emit the message to a specific socket uuids list
@@ -416,22 +208,6 @@ func (sm *SocketInstance) Broadcast(message []byte, mType ...int) {
 	for _, kws := range sm.pool.all() {
 		kws.Emit(message, mType...)
 	}
-}
-
-// BroadcastFilter 新增：基于过滤器的广播方法
-func (sm *SocketInstance) BroadcastFilter(message []byte, filter FilterFunc, mType ...int) {
-	for _, kws := range sm.pool.all() {
-		if filter == nil || filter(kws) {
-			kws.Emit(message, mType...)
-		}
-	}
-}
-
-// BroadcastExcept 新增：排除特定连接的广播
-func (sm *SocketInstance) BroadcastExcept(message []byte, exceptUUID string, mType ...int) {
-	sm.BroadcastFilter(message, func(kws ws) bool {
-		return kws.GetUUID() != exceptUUID
-	}, mType...)
 }
 
 // EmitTo Emit to a specific socket connection
@@ -474,10 +250,6 @@ func fakeNewWrapper(handler func(conn *websocket.Conn), conn *websocket.Conn) ht
 }
 
 func (sm *SocketInstance) New(callback func(kws *WebsocketWrapper), conn *websocket.Conn) (http.HandlerFunc, error) {
-	// 如果是单UUID Mode，需要踹掉上一个连接 注意不要触发检查
-	if sm.SingleMode.Load() && sm.SingleModeUUID == "" {
-		return nil, ErrorUUIDIsEmpty
-	}
 	// 这个函数不报错的原因是因为conn部分已经被初始化过了
 	tempFunction := func(c *websocket.Conn) {
 		kws := &WebsocketWrapper{
@@ -488,22 +260,9 @@ func (sm *SocketInstance) New(callback func(kws *WebsocketWrapper), conn *websoc
 			isAlive:    true,
 			manager:    sm,
 		}
+		// todo: 单模式
+		kws.UUID = kws.createUUID()
 
-		// 每次查找原本的pool有没有，有的话踹掉
-		if sm.SingleMode.Load() {
-			kws.UUID = sm.SingleModeUUID
-			if sm.pool.contains(kws.UUID) {
-				get, err := sm.pool.get(kws.UUID)
-				if err != nil {
-					return
-				}
-				get.disconnected(ErrorClosedError)
-				sm.pool.delete(kws.UUID)
-			}
-		} else {
-			// Generate uuid
-			kws.UUID = kws.createUUID()
-		}
 		// register the connection into the pool
 		sm.pool.set(kws)
 
@@ -518,80 +277,80 @@ func (sm *SocketInstance) New(callback func(kws *WebsocketWrapper), conn *websoc
 	return fakeNewWrapper(tempFunction, conn), nil
 }
 
-func (kws *WebsocketWrapper) setConnectionOptions() {
-	kws.WebsocketDialer.EnableCompression = kws.ConnectionOptions.UseCompression
-	kws.WebsocketDialer.TLSClientConfig =
-		&tls.Config{InsecureSkipVerify: kws.ConnectionOptions.UseSSL} //nolint:gosec // 考虑到部分情况下，确实证书是自签的难以信任
-	kws.WebsocketDialer.Proxy = kws.ConnectionOptions.Proxy
-	kws.WebsocketDialer.Subprotocols = kws.ConnectionOptions.Subprotocols
+// NewClient
+func (sm *SocketInstance) NewClient(url string, options ClientOptions) *WebsocketWrapper {
+	// 通过类似 gowebsocket 的初始化方式进行初始化
+	kws := &WebsocketWrapper{
+		queue:           make(chan message, 100),
+		attributes:      make(map[string]interface{}),
+		isAlive:         false,
+		manager:         sm,
+		ClientOptions:   options,
+		URL:             url,
+		WebsocketDialer: &websocket.Dialer{},
+		RequestHeader:   http.Header{},
+	}
+	return kws
 }
-func (kws *WebsocketWrapper) Connect() error {
-	var err error
-	var resp *http.Response
-	kws.setConnectionOptions()
 
-	// 应用Dialer配置
-	applyDialerOptions(kws.WebsocketDialer, kws.ConnectionOptions)
-
-	kws.Conn, resp, err = kws.WebsocketDialer.Dial(kws.URL, kws.RequestHeader)
+func (kws *WebsocketWrapper) ClientConnect(callback func(kws *WebsocketWrapper)) error {
+	// 如果已经连接，直接返回
+	if kws.IsAlive() {
+		return nil
+	}
+	err := kws.connect()
 	if err != nil {
-		// logger.Error.Println("Error while connecting to server ", err)
-		if resp != nil {
-			// logger.Error.Println("HTTP Response %d status: %s", resp.StatusCode, resp.Status)
-		}
+		return err
+	}
+
+	// 只在第一次连接时生成 UUID 和注册到池中
+	if kws.UUID == "" {
+		kws.UUID = kws.createUUID()
+		kws.manager.pool.set(kws)
+	}
+
+	// execute the callback of the socket initialization
+	if callback != nil {
+		callback(kws)
+	}
+
+	kws.fireEvent(EventConnect, nil, nil)
+
+	// Run the loop for the given connection
+	kws.done = make(chan struct{}, 1)
+	// 重置 once
+	kws.once = sync.Once{}
+	go kws.run()
+	return nil
+}
+
+func (kws *WebsocketWrapper) setClientOptions() {
+	kws.WebsocketDialer.EnableCompression = kws.ClientOptions.UseCompression
+	kws.WebsocketDialer.TLSClientConfig =
+		&tls.Config{InsecureSkipVerify: kws.ClientOptions.UseSSL} //nolint:gosec // 考虑到部分情况下，确实证书是自签的难以信任
+	kws.WebsocketDialer.Proxy = kws.ClientOptions.Proxy
+	kws.WebsocketDialer.Subprotocols = kws.ClientOptions.Subprotocols
+}
+func (kws *WebsocketWrapper) connect() error {
+	var err error
+	kws.setClientOptions()
+
+	kws.Conn, _, err = kws.WebsocketDialer.Dial(kws.URL, kws.RequestHeader)
+	if err != nil {
 		// 调用连接错误回调
+		kws.setAlive(false)
 		if kws.OnConnectError != nil {
 			kws.OnConnectError(err)
 		}
 		return err
 	}
-
-	// 设置ClientFlag = true
+	// 客户端模式
 	kws.ClientFlag = true
-
-	// 安装默认处理器
-	kws.installDefaultHandlers()
-
+	kws.setAlive(true)
 	// 调用连接成功回调
 	if kws.OnConnected != nil {
 		kws.OnConnected()
 	}
-
-	// logger.Info.Println("Connected to server")
-	return nil
-}
-
-// NewClient
-func (sm *SocketInstance) NewClient(callback func(kws *WebsocketWrapper), url string, options ConnectionOptions) error {
-	// 通过类似 gowebsocket 的初始化方式进行初始化
-	kws := &WebsocketWrapper{
-		queue:             make(chan message, 100),
-		done:              make(chan struct{}, 1),
-		attributes:        make(map[string]interface{}),
-		isAlive:           true,
-		manager:           sm,
-		ConnectionOptions: options,
-		URL:               url,
-		// 客户端模式需要 Dialer 与 Header
-		WebsocketDialer:   &websocket.Dialer{},
-		RequestHeader:     http.Header{},
-	}
-	if err := kws.Connect(); err != nil {
-		return err
-	}
-	// Generate uuid
-	kws.UUID = kws.createUUID()
-
-	// register the connection into the pool
-	sm.pool.set(kws)
-
-	// execute the callback of the socket initialization
-	callback(kws)
-
-	kws.fireEvent(EventConnect, nil, nil)
-
-	// Run the loop for the given connection (非阻塞)
-	go kws.run()
 	return nil
 }
 
@@ -602,7 +361,6 @@ func (kws *WebsocketWrapper) GetUUID() string {
 }
 
 func (kws *WebsocketWrapper) SetUUID(uuid string) error {
-	// TODO: .
 	kws.mu.Lock()
 	defer kws.mu.Unlock()
 
@@ -812,53 +570,10 @@ func (kws *WebsocketWrapper) run() {
 
 // Listen for incoming messages
 // and filter by message type
-// handleMessage 处理接收到的消息，支持并发和顺序处理
-func (kws *WebsocketWrapper) handleMessage(mType int, msg []byte) {
-	// 根据不同信息类型，发送对应的数据
-	// 收到PING和PONG信息时
-	if mType == PingMessage {
-		kws.fireEvent(EventPing, nil, nil)
-		// 调用快捷回调
-		if kws.OnPingReceived != nil {
-			kws.OnPingReceived(string(msg))
-		}
-		return
-	}
-
-	if mType == PongMessage {
-		kws.fireEvent(EventPong, nil, nil)
-		// 调用快捷回调
-		if kws.OnPongReceived != nil {
-			kws.OnPongReceived(string(msg))
-		}
-		return
-	}
-	// 收到关闭消息时
-	if mType == CloseMessage {
-		kws.disconnected(nil)
-		return
-	}
-
-	// 处理文本和二进制消息
-	if mType == TextMessage {
-		// 调用快捷回调
-		if kws.OnTextMessage != nil {
-			kws.OnTextMessage(string(msg))
-		}
-	} else if mType == BinaryMessage {
-		// 调用快捷回调
-		if kws.OnBinaryMessage != nil {
-			kws.OnBinaryMessage(msg)
-		}
-	}
-
-	// We have a message and we fire the message event
-	kws.fireEvent(EventMessage, msg, nil)
-}
-
 func (kws *WebsocketWrapper) read(ctx context.Context) {
 	timeoutTicker := time.NewTicker(ReadTimeout)
 	defer timeoutTicker.Stop()
+
 	for {
 		select {
 		case <-timeoutTicker.C:
@@ -870,24 +585,38 @@ func (kws *WebsocketWrapper) read(ctx context.Context) {
 			mType, msg, err := kws.Conn.ReadMessage()
 			kws.mu.RUnlock()
 
-			// 读取消息错误的时候断开连接
-			if err != nil {
+			switch {
+			case mType == PingMessage:
+				kws.fireEvent(EventPing, nil, nil)
+				if kws.OnPingReceived != nil {
+					kws.OnPingReceived(string(msg))
+				}
+			case mType == PongMessage:
+				kws.fireEvent(EventPong, nil, nil)
+				if kws.OnPongReceived != nil {
+					kws.OnPongReceived(string(msg))
+				}
+			case mType == CloseMessage:
+				kws.disconnected(nil)
+				return
+			case mType == TextMessage:
+				if kws.OnTextMessage != nil {
+					kws.OnTextMessage(string(msg))
+				}
+				kws.fireEvent(EventMessage, msg, nil)
+			case mType == BinaryMessage:
+				if kws.OnBinaryMessage != nil {
+					kws.OnBinaryMessage(msg)
+				}
+				kws.fireEvent(EventMessage, msg, nil)
+			case err != nil:
+				// 此处的快捷通知已经在函数内了
 				kws.disconnected(err)
 				return
+			default:
+				kws.fireEvent(EventMessage, msg, nil)
 			}
 
-			// 检查是否启用并发消息处理
-			if kws.manager != nil && kws.manager.isConcurrentHandlingEnabled() {
-				// 并发处理：在新的goroutine中处理消息
-				go kws.handleMessage(mType, msg)
-			} else {
-				// 顺序处理：在当前goroutine中处理消息
-				kws.handleMessage(mType, msg)
-				// 如果是关闭消息，需要退出读取循环
-				if mType == CloseMessage {
-					return
-				}
-			}
 		case <-ctx.Done():
 			return
 		}
@@ -896,20 +625,18 @@ func (kws *WebsocketWrapper) read(ctx context.Context) {
 
 // When the connection closes, disconnected method
 func (kws *WebsocketWrapper) disconnected(err error) {
-	// 我们要在这里考虑判断逻辑，然后重新连接（若需要）
-	kws.fireEvent(EventDisconnect, nil, err)
-
-	// 调用快捷回调
-	if kws.OnDisconnected != nil {
-		kws.OnDisconnected(err)
-	}
-
 	// may be called multiple times from different go routines
 	if kws.IsAlive() {
 		kws.once.Do(func() {
 			kws.setAlive(false)
 			close(kws.done)
 		})
+	}
+	// 发送断线等逻辑
+	kws.fireEvent(EventDisconnect, nil, err)
+
+	if kws.OnDisconnected != nil {
+		kws.OnDisconnected(err)
 	}
 
 	// Fire error event if the connection is
@@ -938,65 +665,6 @@ func (kws *WebsocketWrapper) randomUUID() string {
 //	event - 事件名称，用于识别要触发的事件。
 //	data - 事件数据，以字节切片形式传递给回调函数。
 //	error - 事件错误，传递给回调函数的错误信息（如果有）。
-//
-// applyDialerOptions 统一应用Dialer配置
-func applyDialerOptions(d *websocket.Dialer, opts ConnectionOptions) {
-	d.EnableCompression = opts.UseCompression
-	if opts.UseSSL {
-		d.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	}
-	d.Proxy = opts.Proxy
-	d.Subprotocols = opts.Subprotocols
-}
-
-// BuildProxy 构造代理函数
-func BuildProxy(proxyURL string) (func(*http.Request) (*url.URL, error), error) {
-	if proxyURL == "" {
-		return nil, nil
-	}
-
-	u, err := url.Parse(proxyURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid proxy URL: %v", err)
-	}
-
-	return func(*http.Request) (*url.URL, error) {
-		return u, nil
-	}, nil
-}
-
-// installDefaultHandlers 安装默认的WebSocket处理器
-func (kws *WebsocketWrapper) installDefaultHandlers() {
-	if kws.Conn == nil {
-		return
-	}
-
-	// 设置Ping处理器
-	kws.Conn.SetPingHandler(func(data string) error {
-		kws.fireEvent(EventPing, []byte(data), nil)
-		if kws.OnPingReceived != nil {
-			kws.OnPingReceived(data)
-		}
-		return nil
-	})
-
-	// 设置Pong处理器
-	kws.Conn.SetPongHandler(func(data string) error {
-		kws.fireEvent(EventPong, []byte(data), nil)
-		if kws.OnPongReceived != nil {
-			kws.OnPongReceived(data)
-		}
-		return nil
-	})
-
-	// 设置Close处理器
-	kws.Conn.SetCloseHandler(func(code int, text string) error {
-		kws.fireEvent(EventClose, []byte(text), nil)
-		kws.disconnected(nil)
-		return nil
-	})
-}
-
 func (kws *WebsocketWrapper) fireEvent(event string, data []byte, error error) {
 	// 获取指定事件的所有回调函数。
 	callbacks := kws.manager.listeners.get(event)

@@ -1,6 +1,8 @@
 package socketio
 
-import "github.com/PaienNate/pineutil/syncmap"
+import (
+	"github.com/PaienNate/pineutil/syncmap"
+)
 
 // safeListeners 是一个线程安全的事件监听器集合.
 type safeListeners struct {

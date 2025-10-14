@@ -1,9 +1,10 @@
 package syncmap
 
 import (
-	"github.com/bytedance/sonic"
 	"sync"
 	"sync/atomic"
+
+	"github.com/bytedance/sonic"
 )
 
 type SyncMap[K comparable, V any] struct {
