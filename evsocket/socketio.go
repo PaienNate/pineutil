@@ -265,14 +265,19 @@ func (sm *SocketInstance) New(callback func(kws *WebsocketWrapper), conn *websoc
 
 		// register the connection into the pool
 		sm.pool.set(kws)
+		// 优化初始化顺序：先启动循环，再执行回调，最后触发连接事件。
+		// 这样可以避免在回调中等待消息时产生阻塞（读写循环尚未启动）。
+		// 启动读写与心跳循环（在独立协程中阻塞，直到连接关闭）
+		go kws.run()
 
-		// execute the callback of the socket initialization
+		// 执行用户的初始化回调（此时循环已启动，可安全发送/等待消息）
 		callback(kws)
 
+		// 触发连接事件（保持与旧行为一致：在 callback 之后触发）
 		kws.fireEvent(EventConnect, nil, nil)
 
-		// Run the loop for the given connection
-		kws.run()
+		// 保持 Handler 阻塞直至连接关闭，避免提前返回导致资源清理混乱
+		<-kws.done
 	}
 	return fakeNewWrapper(tempFunction, conn), nil
 }
@@ -309,18 +314,23 @@ func (kws *WebsocketWrapper) ClientConnect(callback func(kws *WebsocketWrapper))
 		kws.manager.pool.set(kws)
 	}
 
-	// execute the callback of the socket initialization
-	if callback != nil {
-		callback(kws)
-	}
-
-	kws.fireEvent(EventConnect, nil, nil)
-
 	// Run the loop for the given connection
 	kws.done = make(chan struct{}, 1)
 	// 重置 once
 	kws.once = sync.Once{}
+	// 优化初始化顺序：先启动循环，再执行回调，最后触发连接事件。
+	// 这样可以避免在回调中等待消息时产生阻塞（读写循环尚未启动）。
+	// 启动读写与心跳循环（在独立协程中阻塞，直到连接关闭）
 	go kws.run()
+
+	// 执行用户的初始化回调（此时循环已启动，可安全发送/等待消息）
+	callback(kws)
+
+	// 触发连接事件（保持与旧行为一致：在 callback 之后触发）
+	kws.fireEvent(EventConnect, nil, nil)
+
+	// 保持 Handler 阻塞直至连接关闭，避免提前返回导致资源清理混乱
+	<-kws.done
 	return nil
 }
 
