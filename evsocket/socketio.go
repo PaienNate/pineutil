@@ -184,6 +184,8 @@ type SocketInstance struct {
 	listeners safeListeners
 	// 是否不允许多连接。启动后，第二个连接时，会自动踹掉
 	SingleMode atomic.Bool
+	// 升级的时候用的
+	Upgrader *websocket.Upgrader
 }
 
 func NewSocketInstance() *SocketInstance {
@@ -191,6 +193,13 @@ func NewSocketInstance() *SocketInstance {
 	return &SocketInstance{
 		pool:      safePool{},
 		listeners: safeListeners{},
+		Upgrader: &websocket.Upgrader{
+			ReadBufferSize:  1024,
+			WriteBufferSize: 1024,
+			CheckOrigin: func(r *http.Request) bool {
+				return true
+			},
+		},
 	}
 }
 
@@ -243,43 +252,43 @@ func (sm *SocketInstance) On(event string, callback eventCallback) {
 	sm.listeners.set(event, callback)
 }
 
-func fakeNewWrapper(handler func(conn *websocket.Conn), conn *websocket.Conn) http.HandlerFunc {
-	return func(_ http.ResponseWriter, _ *http.Request) {
-		handler(conn)
-	}
-}
-
-func (sm *SocketInstance) New(callback func(kws *WebsocketWrapper), conn *websocket.Conn) (http.HandlerFunc, error) {
-	// 这个函数不报错的原因是因为conn部分已经被初始化过了
-	tempFunction := func(c *websocket.Conn) {
-		kws := &WebsocketWrapper{
-			Conn:       c,
-			queue:      make(chan message, 100),
-			done:       make(chan struct{}, 1),
-			attributes: make(map[string]interface{}),
-			isAlive:    true,
-			manager:    sm,
+func (sm *SocketInstance) New(callback func(kws *WebsocketWrapper)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		conn, err := sm.Upgrader.Upgrade(w, r, w.Header())
+		if err != nil {
+			return
 		}
-		// todo: 单模式
-		kws.UUID = kws.createUUID()
+		// 这个函数不报错的原因是因为conn部分已经被初始化过了
+		tempFunction := func(c *websocket.Conn) {
+			kws := &WebsocketWrapper{
+				Conn:       c,
+				queue:      make(chan message, 100),
+				done:       make(chan struct{}, 1),
+				attributes: make(map[string]interface{}),
+				isAlive:    true,
+				manager:    sm,
+			}
+			// todo: 单模式
+			kws.UUID = kws.createUUID()
 
-		// register the connection into the pool
-		sm.pool.set(kws)
-		// 优化初始化顺序：先启动循环，再执行回调，最后触发连接事件。
-		// 这样可以避免在回调中等待消息时产生阻塞（读写循环尚未启动）。
-		// 启动读写与心跳循环（在独立协程中阻塞，直到连接关闭）
-		go kws.run()
+			// register the connection into the pool
+			sm.pool.set(kws)
+			// 优化初始化顺序：先启动循环，再执行回调，最后触发连接事件。
+			// 这样可以避免在回调中等待消息时产生阻塞（读写循环尚未启动）。
+			// 启动读写与心跳循环（在独立协程中阻塞，直到连接关闭）
+			go kws.run()
 
-		// 执行用户的初始化回调（此时循环已启动，可安全发送/等待消息）
-		callback(kws)
+			// 执行用户的初始化回调（此时循环已启动，可安全发送/等待消息）
+			callback(kws)
 
-		// 触发连接事件（保持与旧行为一致：在 callback 之后触发）
-		kws.fireEvent(EventConnect, nil, nil)
+			// 触发连接事件（保持与旧行为一致：在 callback 之后触发）
+			kws.fireEvent(EventConnect, nil, nil)
 
-		// 保持 Handler 阻塞直至连接关闭，避免提前返回导致资源清理混乱
-		<-kws.done
+			// 保持 Handler 阻塞直至连接关闭，避免提前返回导致资源清理混乱
+			<-kws.done
+		}
+		tempFunction(conn)
 	}
-	return fakeNewWrapper(tempFunction, conn), nil
 }
 
 // NewClient
