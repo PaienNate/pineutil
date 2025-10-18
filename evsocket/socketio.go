@@ -179,18 +179,21 @@ type ws interface {
 
 // 公共方法抽离
 
+
 type SocketInstance struct {
 	pool      safePool
 	listeners safeListeners
 	// 是否不允许多连接。启动后，第二个连接时，会自动踹掉
 	SingleMode atomic.Bool
+	// 实例是否已关闭
+	isShutdown atomic.Bool
 	// 升级的时候用的
 	Upgrader *websocket.Upgrader
 }
 
 func NewSocketInstance() *SocketInstance {
 	// 使用SyncMap后，可以直接省略这里的初始化
-	return &SocketInstance{
+	instance := &SocketInstance{
 		pool:      safePool{},
 		listeners: safeListeners{},
 		Upgrader: &websocket.Upgrader{
@@ -201,6 +204,8 @@ func NewSocketInstance() *SocketInstance {
 			},
 		},
 	}
+	instance.isShutdown.Store(false)
+	return instance
 }
 
 // EmitToList Emit the message to a specific socket uuids list
@@ -212,8 +217,10 @@ func (sm *SocketInstance) EmitToList(uuids []string, message []byte, mType ...in
 }
 
 // Broadcast to all the active connections
-// 在客户端模式下，这个UUID列表实际上只有一个，所以做了一点无用功，但性能影响应该不大
 func (sm *SocketInstance) Broadcast(message []byte, mType ...int) {
+	if sm.IsShutdown() {
+		return
+	}
 	for _, kws := range sm.pool.all() {
 		kws.Emit(message, mType...)
 	}
@@ -221,6 +228,10 @@ func (sm *SocketInstance) Broadcast(message []byte, mType ...int) {
 
 // EmitTo Emit to a specific socket connection
 func (sm *SocketInstance) EmitTo(uuid string, message []byte, mType ...int) error {
+	if sm.IsShutdown() {
+		return errors.New("socket instance has been shutdown")
+	}
+	
 	conn, err := sm.pool.get(uuid)
 	if err != nil {
 		return err
@@ -236,6 +247,9 @@ func (sm *SocketInstance) EmitTo(uuid string, message []byte, mType ...int) erro
 
 // Fire custom event on all connections
 func (sm *SocketInstance) Fire(event string, data []byte) {
+	if sm.IsShutdown() {
+		return
+	}
 	sm.fireGlobalEvent(event, data, nil)
 }
 
@@ -247,8 +261,39 @@ func (sm *SocketInstance) fireGlobalEvent(event string, data []byte, error error
 	}
 }
 
+// IsShutdown 检查实例是否已关闭
+func (sm *SocketInstance) IsShutdown() bool {
+	return sm.isShutdown.Load()
+}
+
+// Shutdown 优雅关闭SocketInstance，关闭所有连接并清理资源
+func (sm *SocketInstance) Shutdown() error {
+	// 防止重复关闭
+	if !sm.isShutdown.CompareAndSwap(false, true) {
+		return nil // 已经关闭了
+	}
+
+	// 获取所有连接并关闭
+	connections := sm.pool.all()
+	for _, conn := range connections {
+		if conn.IsAlive() {
+			// 发送关闭消息
+			conn.Close()
+			// 等待连接自然断开，由disconnected方法处理清理
+		}
+	}
+
+	// 清理监听器
+	sm.listeners = safeListeners{}
+	
+	return nil
+}
+
 // On Add listener callback for an event into the listeners list
 func (sm *SocketInstance) On(event string, callback eventCallback) {
+	if sm.IsShutdown() {
+		return // 已关闭的实例不接受新的监听器
+	}
 	sm.listeners.set(event, callback)
 }
 
@@ -312,6 +357,27 @@ func (kws *WebsocketWrapper) ClientConnect(callback func(kws *WebsocketWrapper))
 	if kws.IsAlive() {
 		return nil
 	}
+	
+	// 检查manager是否已关闭
+	if kws.manager.IsShutdown() {
+		return errors.New("socket instance has been shutdown")
+	}
+	
+	// 如果是重连，先清理之前的资源
+	if kws.UUID != "" && kws.done != nil {
+		// 确保之前的连接已经完全关闭
+		select {
+		case <-kws.done:
+			// 之前的连接已经关闭，可以继续
+		default:
+			// 强制关闭之前的连接
+			if kws.Conn != nil {
+				kws.Conn.Close()
+			}
+			close(kws.done)
+		}
+	}
+	
 	err := kws.connect()
 	if err != nil {
 		return err
@@ -460,6 +526,9 @@ func (kws *WebsocketWrapper) EmitTo(uuid string, message []byte, mType ...int) e
 // Broadcast to all the active connections
 // except avoid broadcasting the message to itself
 func (kws *WebsocketWrapper) Broadcast(message []byte, except bool, mType ...int) {
+	if kws.manager.IsShutdown() {
+		return
+	}
 	// 特殊判断：若是客户端，except能且只能是false
 	if kws.ClientFlag {
 		except = false
@@ -648,9 +717,14 @@ func (kws *WebsocketWrapper) disconnected(err error) {
 	if kws.IsAlive() {
 		kws.once.Do(func() {
 			kws.setAlive(false)
+			// 客户端情况下显式关闭底层连接
+			if kws.ClientFlag && kws.Conn != nil {
+				kws.Conn.Close()
+			}
 			close(kws.done)
 		})
 	}
+
 	// 发送断线等逻辑
 	kws.fireEvent(EventDisconnect, nil, err)
 
