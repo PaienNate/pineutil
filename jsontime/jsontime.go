@@ -12,6 +12,14 @@ const timeFormat = "2006-01-02 15:04:05"
 // timezone 定义了时间的时区，用于将时间转换到特定的时区
 const timeZone = "Asia/Shanghai"
 
+func location() *time.Location {
+	loc, err := time.LoadLocation(timeZone)
+	if err != nil {
+		return time.Local
+	}
+	return loc
+}
+
 // Time 是 time.Time 的别名，用于添加自定义的序列化和反序列化行为
 type Time time.Time
 
@@ -20,15 +28,14 @@ type Time time.Time
 // - []byte: 序列化后的 JSON 字符串
 // - error: 错误信息
 func (t Time) MarshalJSON() ([]byte, error) {
-	// 创建一个足够大的字节切片来存储时间格式
+	ti := time.Time(t)
+	if ti.IsZero() {
+		return []byte("null"), nil
+	}
 	b := make([]byte, 0, len(timeFormat)+2)
-	// 添加双引号开始
 	b = append(b, '"')
-	// 将时间格式化并追加到字节切片中
-	b = time.Time(t).AppendFormat(b, timeFormat)
-	// 添加双引号结束
+	b = ti.AppendFormat(b, timeFormat)
 	b = append(b, '"')
-	// 返回序列化后的 JSON 字符串和错误信息
 	return b, nil
 }
 
@@ -38,24 +45,21 @@ func (t Time) MarshalJSON() ([]byte, error) {
 // 返回值:
 // - error: 错误信息
 func (t *Time) UnmarshalJSON(data []byte) (err error) {
-	// 检查数据是否为空或空字符串
-	if len(data) == 0 || string(data) == `""` {
-		// 如果数据为空或空字符串，设置时间为默认初始值 9999-12-31
-		*t = Time(time.Date(9999, 12, 31, 0, 0, 0, 0, time.Local))
-		// 返回 nil 表示成功
+	s := string(data)
+	if s == "null" || s == "NULL" {
+		*t = Time(time.Time{})
 		return nil
 	}
-	// 解析 JSON 数据中的时间字符串
-	now, err := time.ParseInLocation(`"`+timeFormat+`"`, string(data), time.Local)
-	// 检查解析是否出错
+	if s == `""` {
+		*t = Time(time.Time{})
+		return nil
+	}
+	now, err := time.ParseInLocation(`"`+timeFormat+`"`, s, location())
 	if err != nil {
-		// 返回解析错误
 		return err
 	}
-	// 设置解析后的时间
 	*t = Time(now)
-	// 返回 nil 表示成功
-	return
+	return nil
 }
 
 // String 实现了 Time 类型的自定义字符串表示
@@ -70,10 +74,8 @@ func (t Time) String() string {
 // 返回值:
 // - time.Time: 转换后的本地时间
 func (t Time) Local() time.Time {
-	// 加载指定的时区
-	loc, _ := time.LoadLocation(timeZone)
 	// 将时间转换到指定的时区并返回
-	return time.Time(t).In(loc)
+	return time.Time(t).In(location())
 }
 
 // Value 实现了 Time 类型的数据库驱动值表示
@@ -81,16 +83,10 @@ func (t Time) Local() time.Time {
 // - driver.Value: 数据库驱动值
 // - error: 错误信息
 func (t Time) Value() (driver.Value, error) {
-	// 定义零时间
-	var zeroTime time.Time
-	// 将 Time 类型转换为 time.Time 类型
-	var ti = time.Time(t)
-	// 检查时间是否为零时间
-	if ti.UnixNano() == zeroTime.UnixNano() {
-		// 如果是零时间，返回 nil 表示未初始化的数据
+	ti := time.Time(t)
+	if ti.IsZero() {
 		return nil, nil //nolint:nilnil
 	}
-	// 返回时间的数据库驱动值
 	return ti, nil
 }
 
@@ -100,15 +96,59 @@ func (t Time) Value() (driver.Value, error) {
 // 返回值:
 // - error: 错误信息
 func (t *Time) Scan(v interface{}) error {
-	// 尝试将数据库驱动值转换为 time.Time 类型
-	value, ok := v.(time.Time)
-	// 检查转换是否成功
-	if ok {
-		// 如果转换成功，设置时间
-		*t = Time(value)
-		// 返回 nil 表示成功
+	if v == nil {
+		*t = Time(time.Time{})
 		return nil
 	}
-	// 如果转换失败，返回错误信息
+	value, ok := v.(time.Time)
+	if ok {
+		*t = Time(value.In(location()))
+		return nil
+	}
 	return fmt.Errorf("can not convert %v to timestamp", v)
+}
+
+// 补充一些实用函数，以快速将字符串转换为时间类型，获取time.Time类型的当前时间
+func (t Time) Time() time.Time {
+	return time.Time(t)
+}
+
+// Now 返回当前时间的 Time 类型表示
+// 返回值:
+// - Time: 当前时间的 Time 类型表示
+func Now() Time {
+	return Time(time.Now().In(location()))
+}
+
+// FromString 从字符串创建 Time 类型
+// 参数:
+// - s: 时间字符串
+// 返回值:
+// - Time: 解析后的 Time 类型
+func FromString(s string) (Time, error) {
+	// 解析字符串中的时间
+	t, err := time.ParseInLocation(timeFormat, s, location())
+	// 检查解析是否出错
+	if err != nil {
+		// 返回解析错误
+		return Time{}, err
+	}
+	// 返回解析后的 Time 类型
+	return Time(t), nil
+}
+
+func FromTime(t time.Time) Time {
+	return Time(t.In(location()))
+}
+
+func FromUnix(sec int64) Time {
+	return FromTime(time.Unix(sec, 0))
+}
+
+func FromUnixMilli(ms int64) Time {
+	return FromTime(time.Unix(0, ms*int64(time.Millisecond)))
+}
+
+func FromUnixNano(ns int64) Time {
+	return FromTime(time.Unix(0, ns))
 }
