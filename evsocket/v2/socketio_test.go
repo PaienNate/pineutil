@@ -103,10 +103,11 @@ func TestSocketInstanceMessageEventUsesStableAttributeSnapshot(t *testing.T) {
 		value, _ := attrs["phase"].(string)
 		observed <- value
 	})
-	server := httptest.NewServer(sm.New(func(kws *WebsocketWrapper) {
-		kws.SetAttribute("phase", "before")
-		connected <- kws
-	}))
+	sm.On(EventConnect, func(payload *EventPayload) {
+		payload.Kws.SetAttribute("phase", "before")
+		connected <- payload.Kws
+	})
+	server := httptest.NewServer(sm.New())
 	t.Cleanup(server.Close)
 	clientConn, _, err := websocket.DefaultDialer.Dial(wsTestURL(server.URL), nil)
 	if err != nil {
@@ -130,7 +131,8 @@ func TestWebsocketWrapperDisconnectedFiresDisconnectEventOnce(t *testing.T) {
 	connected := make(chan *WebsocketWrapper, 1)
 	var disconnects atomic.Int64
 	sm.On(EventDisconnect, func(payload *EventPayload) { disconnects.Add(1) })
-	server := httptest.NewServer(sm.New(func(kws *WebsocketWrapper) { connected <- kws }))
+	sm.On(EventConnect, func(payload *EventPayload) { connected <- payload.Kws })
+	server := httptest.NewServer(sm.New())
 	t.Cleanup(server.Close)
 	clientConn, _, err := websocket.DefaultDialer.Dial(wsTestURL(server.URL), nil)
 	if err != nil {
@@ -151,9 +153,10 @@ func TestGetRequestHeader(t *testing.T) {
 	t.Run("server reverse mode reads handshake authorization", func(t *testing.T) {
 		sm := NewSocketInstance()
 		authorization := make(chan string, 1)
-		server := httptest.NewServer(sm.New(func(kws *WebsocketWrapper) {
-			authorization <- kws.GetRequestHeader("authorization")
-		}))
+		sm.On(EventConnect, func(payload *EventPayload) {
+			authorization <- payload.Kws.GetRequestHeader("authorization")
+		})
+		server := httptest.NewServer(sm.New())
 		t.Cleanup(server.Close)
 
 		requestHeader := http.Header{}
@@ -249,9 +252,10 @@ func TestSocketInstanceEmitToAndBroadcastRouteAcrossServerSessions(t *testing.T)
 	sm := NewSocketInstance()
 	connected := make(chan *WebsocketWrapper, 2)
 
-	server := httptest.NewServer(sm.New(func(kws *WebsocketWrapper) {
-		connected <- kws
-	}))
+	sm.On(EventConnect, func(payload *EventPayload) {
+		connected <- payload.Kws
+	})
+	server := httptest.NewServer(sm.New())
 	t.Cleanup(server.Close)
 
 	clientA, _, err := websocket.DefaultDialer.Dial(wsTestURL(server.URL), nil)
@@ -644,15 +648,15 @@ func TestServerOpenCallbackRunsBeforeAsyncConnectEvent(t *testing.T) {
 	sm := NewSocketInstance()
 	initDone := make(chan string, 1)
 	connectUUID := make(chan string, 1)
-	server := httptest.NewServer(sm.New(func(kws *WebsocketWrapper) {
-		kws.SetAttribute("role", "server-init")
-		initDone <- kws.GetUUID()
-	}))
-	t.Cleanup(server.Close)
-
+	sm.On(EventConnect, func(payload *EventPayload) {
+		payload.Kws.SetAttribute("role", "server-init")
+		initDone <- payload.Kws.GetUUID()
+	})
 	sm.On(EventConnect, func(payload *EventPayload) {
 		connectUUID <- payload.SocketUUID
 	})
+	server := httptest.NewServer(sm.New())
+	t.Cleanup(server.Close)
 
 	clientConn, _, err := websocket.DefaultDialer.Dial(wsTestURL(server.URL), nil)
 	if err != nil {
@@ -673,6 +677,8 @@ func TestServerEventConnectCanWaitForFirstMessage(t *testing.T) {
 	handlersSet := make(chan struct{})
 	firstMessage := make(chan error, 1)
 	sm.On(EventConnect, func(payload *EventPayload) {
+		initReady <- payload.Kws
+
 		session := payload.Kws
 		receivedByEvent := make(chan string, 1)
 		session.OnTextMessage = func(message string) {
@@ -693,10 +699,7 @@ func TestServerEventConnectCanWaitForFirstMessage(t *testing.T) {
 			firstMessage <- errors.New("timed out waiting for first message inside EventConnect")
 		}
 	})
-
-	server := httptest.NewServer(sm.New(func(kws *WebsocketWrapper) {
-		initReady <- kws
-	}))
+	server := httptest.NewServer(sm.New())
 	t.Cleanup(server.Close)
 
 	clientConn, _, err := websocket.DefaultDialer.Dial(wsTestURL(server.URL), nil)
@@ -1115,9 +1118,8 @@ func TestSocketInstanceServerOptionsAreAppliedToUpgrade(t *testing.T) {
 		},
 	}
 	connected := make(chan *WebsocketWrapper, 1)
-	server := httptest.NewServer(sm.New(func(kws *WebsocketWrapper) {
-		connected <- kws
-	}))
+	sm.On(EventConnect, func(payload *EventPayload) { connected <- payload.Kws })
+	server := httptest.NewServer(sm.New())
 	t.Cleanup(server.Close)
 
 	clientConn, resp, err := websocket.DefaultDialer.Dial(wsTestURL(server.URL), http.Header{
@@ -1212,12 +1214,13 @@ func TestSessionQuickCallbacksReceivePingPongAndBinary(t *testing.T) {
 	pongReceived := make(chan string, 1)
 	binaryReceived := make(chan []byte, 1)
 
-	server := httptest.NewServer(sm.New(func(kws *WebsocketWrapper) {
-		kws.OnPingReceived = func(data string) { pingReceived <- data }
-		kws.OnPongReceived = func(data string) { pongReceived <- data }
-		kws.OnBinaryMessage = func(data []byte) { binaryReceived <- append([]byte(nil), data...) }
-		connected <- kws
-	}))
+	sm.On(EventConnect, func(payload *EventPayload) {
+		payload.Kws.OnPingReceived = func(data string) { pingReceived <- data }
+		payload.Kws.OnPongReceived = func(data string) { pongReceived <- data }
+		payload.Kws.OnBinaryMessage = func(data []byte) { binaryReceived <- append([]byte(nil), data...) }
+		connected <- payload.Kws
+	})
+	server := httptest.NewServer(sm.New())
 	t.Cleanup(server.Close)
 
 	clientConn, _, err := websocket.DefaultDialer.Dial(wsTestURL(server.URL), nil)
@@ -1253,9 +1256,8 @@ func TestSessionQuickCallbacksReceivePingPongAndBinary(t *testing.T) {
 func TestSocketInstanceBroadcastExceptSkipsSender(t *testing.T) {
 	sm := NewSocketInstance()
 	connected := make(chan *WebsocketWrapper, 2)
-	server := httptest.NewServer(sm.New(func(kws *WebsocketWrapper) {
-		connected <- kws
-	}))
+	sm.On(EventConnect, func(payload *EventPayload) { connected <- payload.Kws })
+	server := httptest.NewServer(sm.New())
 	t.Cleanup(server.Close)
 
 	clientA, _, err := websocket.DefaultDialer.Dial(wsTestURL(server.URL), nil)
@@ -1300,9 +1302,8 @@ func TestSocketInstanceShutdownClosesSessionsAndPreventsFutureUse(t *testing.T) 
 	sm.On(EventDisconnect, func(payload *EventPayload) {
 		disconnects.Add(1)
 	})
-	server := httptest.NewServer(sm.New(func(kws *WebsocketWrapper) {
-		connected <- kws
-	}))
+	sm.On(EventConnect, func(payload *EventPayload) { connected <- payload.Kws })
+	server := httptest.NewServer(sm.New())
 	t.Cleanup(server.Close)
 
 	clientConn, _, err := websocket.DefaultDialer.Dial(wsTestURL(server.URL), nil)

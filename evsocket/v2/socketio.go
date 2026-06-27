@@ -280,8 +280,9 @@ func (sm *SocketInstance) Shutdown() error {
 
 // New 返回一个可直接挂到 `http.HandleFunc` 的服务端 WebSocket 处理函数。
 //
-// 当升级成功后，会创建一个新的 `WebsocketWrapper` facade，并通过回调返回给业务层。
-func (sm *SocketInstance) New(callback func(kws *WebsocketWrapper)) http.HandlerFunc {
+// 当升级成功后，会创建一个新的 `WebsocketWrapper` facade。
+// 初始化 facade 属性、设置回调请使用 EventConnect / OnConnected 异步连接事件。
+func (sm *SocketInstance) New() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if sm.IsShutdown() {
 			http.Error(w, ErrorShutdown.Error(), http.StatusServiceUnavailable)
@@ -289,7 +290,7 @@ func (sm *SocketInstance) New(callback func(kws *WebsocketWrapper)) http.Handler
 		}
 		wrapper := newServerWrapper(sm)
 		wrapper.setRequestHeader(r.Header)
-		handler := &transportHandler{wrapper: wrapper, onOpen: callback}
+		handler := &transportHandler{wrapper: wrapper}
 		upgrader := gws.NewUpgrader(handler, cloneServerOption(sm.ServerOptions))
 		socket, err := upgrader.Upgrade(w, r)
 		if err != nil {
@@ -341,6 +342,7 @@ type WebsocketWrapper struct {
 	eventMu       sync.Mutex
 	eventQueue    []eventEnvelope
 	eventDraining bool
+	connectReady  chan struct{}
 
 	OnConnected    func()
 	OnDisconnected func(err error)
@@ -465,6 +467,10 @@ func (kws *WebsocketWrapper) enqueueEvent(event eventEnvelope) {
 }
 
 func (kws *WebsocketWrapper) drainEvents() {
+	kws.eventMu.Lock()
+	ready := kws.connectReady
+	kws.eventMu.Unlock()
+	<-ready
 	for {
 		kws.eventMu.Lock()
 		if len(kws.eventQueue) == 0 {
@@ -516,9 +522,10 @@ func (kws *WebsocketWrapper) newEventPayload(event string, data []byte, eventErr
 
 func newServerWrapper(sm *SocketInstance) *WebsocketWrapper {
 	return &WebsocketWrapper{
-		UUID:       uuid.NewString(),
-		attributes: make(map[string]any),
-		manager:    sm,
+		UUID:         uuid.NewString(),
+		attributes:   make(map[string]any),
+		manager:      sm,
+		connectReady: make(chan struct{}),
 	}
 }
 
@@ -530,6 +537,7 @@ func newClientWrapper(sm *SocketInstance, rawURL string, options ClientOptions) 
 		clientURL:     rawURL,
 		clientOptions: normalizeClientOptions(options),
 		clientMode:    true,
+		connectReady:  make(chan struct{}),
 	}
 }
 
@@ -772,6 +780,11 @@ func (kws *WebsocketWrapper) setClientState(state clientTransportState) {
 
 func (kws *WebsocketWrapper) connectClientTransport(reconnecting bool) error {
 	opened := make(chan struct{})
+	if reconnecting {
+		kws.eventMu.Lock()
+		kws.connectReady = make(chan struct{})
+		kws.eventMu.Unlock()
+	}
 	handler := &transportHandler{wrapper: kws, opened: opened}
 	requestHeader := cloneHeader(kws.clientOptions.RequestHeader)
 	if len(kws.clientOptions.Subprotocols) > 0 && requestHeader.Get("Sec-WebSocket-Protocol") == "" {
@@ -931,7 +944,6 @@ func (kws *WebsocketWrapper) setRequestHeader(header http.Header) {
 type transportHandler struct {
 	gws.BuiltinEventHandler
 	wrapper *WebsocketWrapper
-	onOpen  func(kws *WebsocketWrapper)
 	opened  chan struct{}
 }
 
@@ -947,9 +959,7 @@ func (h *transportHandler) OnOpen(socket *gws.Conn) {
 		close(h.opened)
 		h.opened = nil
 	}
-	if h.onOpen != nil {
-		h.onOpen(wrapper)
-	}
+	close(wrapper.connectReady)
 	wrapper.dispatchEvent(EventConnect, nil, nil)
 }
 

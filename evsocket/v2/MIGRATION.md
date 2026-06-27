@@ -96,16 +96,18 @@ if err := client.Connect(); err != nil {
 
 这里的 `NewClient(...)` 只创建 facade，不会自动发起连接。
 
-### 3. `ClientConnect` 不再保留
+### 3. `ClientConnect` 和 `New(callback)` 不再保留
 
 如果你在 v1 中依赖：
 
 - `ClientConnect(...)`
+- `New(func(kws *WebsocketWrapper) { ... })`
 
 在 v2 中应改成：
 
 - `Dial(...)`
 - 或 `NewClient(...)` 后显式调用 `Connect()` / `Reconnect()`
+- 服务端初始化改用 `sm.On(EventConnect, func(payload *EventPayload) { payload.Kws.SetUUID(...); ... })` + `sm.New()`
 
 这次改动的目标是让客户端 facade 生命周期更清晰：
 
@@ -148,7 +150,7 @@ token := kws.GetRequestHeader("Authorization")
 
 适用场景：
 
-- 服务端反向模式：在 `New(...)` 回调里读取客户端握手头
+- 服务端反向模式：在 `EventConnect` 监听器里读取客户端握手头
 - 客户端正向模式：读取 `ClientOptions.RequestHeader` 中实际用于握手的头值
 
 注意：

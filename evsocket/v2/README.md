@@ -87,7 +87,7 @@ go test ./evsocket/v2 -run Example -count=1
 - `NewSocketInstance()`
 - `ServerOptions`：服务端 `gws.ServerOption` 配置入口，可继续设置子协议、响应头、压缩、鉴权等握手参数
 - `On(event, callback)`
-- `New(callback)`
+- `New()`
 - `NewClient(url, options)`
 - `Dial(url, options)`
 - `EmitTo(uuid, message, mType...)`
@@ -116,20 +116,23 @@ go test ./evsocket/v2 -run Example -count=1
 
 - 用 `SocketInstance` 维护全局监听与连接池
 - 如果需要自定义服务端握手参数，请在 `SocketInstance.ServerOptions` 上设置
-- **`New(callback)` 是同步初始化钩子**：仅用于设置 `UUID`、`attribute`、绑定回调等短小操作；不应在 `callback` 内等待后续消息
-- 用 `On(...)` 监听 `EventConnect`、`EventMessage`、`EventDisconnect`
-- 用 `New(...)` 挂到 `http.HandleFunc`
-- 连接建立后的业务逻辑应写在 `OnConnected` 或 `EventConnect` 中，这些回调已脱离网络读循环异步执行
+- 用 `On(...)` 监听 `EventConnect`、`EventMessage`、`EventDisconnect` 等事件
+- 用 `New()` 挂到 `http.HandleFunc`
+- 服务端 facade 的初始化（设置 `UUID`、`attribute`、绑定回调）请写在 `OnConnected` 或 `sm.On(EventConnect, ...)` 中
 - `OnXxx` 快捷回调（`OnConnected`、`OnTextMessage`、`OnBinaryMessage`、`OnPingReceived`、`OnPongReceived`、`OnDisconnected`）是同名事件的兼容别名，会在事件监听器之前调用
-
-例如：
 
 ```go
 sm := socketio.NewSocketInstance()
 sm.ServerOptions.SubProtocols = []string{"onebot"}
 sm.ServerOptions.ResponseHeader = http.Header{
-	"X-Server-Mode": []string{"demo"},
+    "X-Server-Mode": []string{"demo"},
 }
+sm.On(socketio.EventConnect, func(payload *socketio.EventPayload) {
+    payload.Kws.SetUUID("custom-id")
+    payload.Kws.SetAttribute("role", "server")
+    // 初始化回调、发欢迎消息等
+})
+http.Handle("/ws", sm.New())
 ```
 
 ### 客户端

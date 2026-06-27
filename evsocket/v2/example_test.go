@@ -57,18 +57,17 @@ func ExampleSocketInstance_New() {
 	messages := make(chan string, 1)
 
 	sm.On(socketio.EventConnect, func(payload *socketio.EventPayload) {
-		connected <- payload.SocketUUID
+		if err := payload.Kws.SetUUID("demo-server-session"); err != nil {
+			panic(err)
+		}
+		payload.Kws.SetAttribute("role", "server-side")
+		connected <- payload.Kws.GetUUID()
 	})
 	sm.On(socketio.EventMessage, func(payload *socketio.EventPayload) {
 		messages <- string(payload.Data)
 	})
 
-	server := httptest.NewServer(sm.New(func(kws *socketio.WebsocketWrapper) {
-		if err := kws.SetUUID("demo-server-session"); err != nil {
-			panic(err)
-		}
-		kws.SetAttribute("role", "server-side")
-	}))
+	server := httptest.NewServer(sm.New())
 	defer server.Close()
 
 	clientConn, _, err := websocket.DefaultDialer.Dial(exampleWSURL(server.URL), nil)
@@ -175,9 +174,10 @@ func ExampleWebsocketWrapper_GetRequestHeader() {
 	sm := socketio.NewSocketInstance()
 	authorization := make(chan string, 1)
 
-	server := httptest.NewServer(sm.New(func(kws *socketio.WebsocketWrapper) {
-		authorization <- kws.GetRequestHeader("Authorization")
-	}))
+	sm.On(socketio.EventConnect, func(payload *socketio.EventPayload) {
+		authorization <- payload.Kws.GetRequestHeader("Authorization")
+	})
+	server := httptest.NewServer(sm.New())
 	defer server.Close()
 
 	requestHeader := http.Header{}
