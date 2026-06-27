@@ -116,9 +116,11 @@ go test ./evsocket/v2 -run Example -count=1
 
 - 用 `SocketInstance` 维护全局监听与连接池
 - 如果需要自定义服务端握手参数，请在 `SocketInstance.ServerOptions` 上设置
+- **`New(callback)` 是同步初始化钩子**：仅用于设置 `UUID`、`attribute`、绑定回调等短小操作；不应在 `callback` 内等待后续消息
 - 用 `On(...)` 监听 `EventConnect`、`EventMessage`、`EventDisconnect`
 - 用 `New(...)` 挂到 `http.HandleFunc`
-- 在回调里只操作 `WebsocketWrapper`
+- 连接建立后的业务逻辑应写在 `OnConnected` 或 `EventConnect` 中，这些回调已脱离网络读循环异步执行
+- `OnXxx` 快捷回调（`OnConnected`、`OnTextMessage`、`OnBinaryMessage`、`OnPingReceived`、`OnPongReceived`、`OnDisconnected`）是同名事件的兼容别名，会在事件监听器之前调用
 
 例如：
 

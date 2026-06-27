@@ -590,6 +590,135 @@ func TestClientLifecycleForExternalFSM(t *testing.T) {
 	assertNoCallback("failed reconnect without built-in retry")
 }
 
+func TestOnConnectedCanWaitForFirstResponseWithoutDeadlockingReader(t *testing.T) {
+	sm := NewSocketInstance()
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		go func() {
+			defer conn.Close()
+			for {
+				messageType, payload, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+				if err := conn.WriteMessage(messageType, payload); err != nil {
+					return
+				}
+			}
+		}()
+	}))
+	t.Cleanup(server.Close)
+
+	client := sm.NewClient(wsTestURL(server.URL), ClientOptions{})
+	t.Cleanup(client.Close)
+	received := make(chan string, 1)
+	connected := make(chan error, 1)
+	client.OnTextMessage = func(message string) { received <- message }
+	client.OnConnected = func() {
+		client.Emit([]byte("login-info"))
+		select {
+		case message := <-received:
+			if message != "login-info" {
+				connected <- errors.New("unexpected response while waiting inside OnConnected")
+				return
+			}
+			connected <- nil
+		case <-time.After(200 * time.Millisecond):
+			connected <- errors.New("timed out waiting for response inside OnConnected")
+		}
+	}
+
+	if err := client.Connect(); err != nil {
+		t.Fatalf("Connect returned error: %v", err)
+	}
+	if err := waitForValue(t, "OnConnected response", connected); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServerOpenCallbackRunsBeforeAsyncConnectEvent(t *testing.T) {
+	sm := NewSocketInstance()
+	initDone := make(chan string, 1)
+	connectUUID := make(chan string, 1)
+	server := httptest.NewServer(sm.New(func(kws *WebsocketWrapper) {
+		kws.SetAttribute("role", "server-init")
+		initDone <- kws.GetUUID()
+	}))
+	t.Cleanup(server.Close)
+
+	sm.On(EventConnect, func(payload *EventPayload) {
+		connectUUID <- payload.SocketUUID
+	})
+
+	clientConn, _, err := websocket.DefaultDialer.Dial(wsTestURL(server.URL), nil)
+	if err != nil {
+		t.Fatalf("dial test server: %v", err)
+	}
+	t.Cleanup(func() { _ = clientConn.Close() })
+
+	initUUID := waitForValue(t, "server init callback", initDone)
+	asyncUUID := waitForValue(t, "async connect event", connectUUID)
+	if initUUID != asyncUUID {
+		t.Fatalf("New(callback) UUID=%q, EventConnect UUID=%q: expected same facade", initUUID, asyncUUID)
+	}
+}
+
+func TestServerEventConnectCanWaitForFirstMessage(t *testing.T) {
+	sm := NewSocketInstance()
+	initReady := make(chan *WebsocketWrapper, 1)
+	handlersSet := make(chan struct{})
+	firstMessage := make(chan error, 1)
+	sm.On(EventConnect, func(payload *EventPayload) {
+		session := payload.Kws
+		receivedByEvent := make(chan string, 1)
+		session.OnTextMessage = func(message string) {
+			select {
+			case receivedByEvent <- message:
+			default:
+			}
+		}
+		close(handlersSet)
+		select {
+		case message := <-receivedByEvent:
+			if message != "hello-server" {
+				firstMessage <- errors.New("unexpected message while waiting inside EventConnect")
+				return
+			}
+			firstMessage <- nil
+		case <-time.After(testTimeout):
+			firstMessage <- errors.New("timed out waiting for first message inside EventConnect")
+		}
+	})
+
+	server := httptest.NewServer(sm.New(func(kws *WebsocketWrapper) {
+		initReady <- kws
+	}))
+	t.Cleanup(server.Close)
+
+	clientConn, _, err := websocket.DefaultDialer.Dial(wsTestURL(server.URL), nil)
+	if err != nil {
+		t.Fatalf("dial test server: %v", err)
+	}
+	t.Cleanup(func() { _ = clientConn.Close() })
+
+	_ = waitForValue(t, "server session", initReady)
+	select {
+	case <-handlersSet:
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for EventConnect to set handlers")
+	}
+	if err := clientConn.WriteMessage(websocket.TextMessage, []byte("hello-server")); err != nil {
+		t.Fatalf("write first message: %v", err)
+	}
+	if err := waitForValue(t, "server EventConnect first message", firstMessage); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestClientConnectAndReconnectReturnShutdownAfterSocketInstanceShutdown(t *testing.T) {
 	sm := NewSocketInstance()
 	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
@@ -1187,9 +1316,7 @@ func TestSocketInstanceShutdownClosesSessionsAndPreventsFutureUse(t *testing.T) 
 		t.Fatalf("Shutdown returned error: %v", err)
 	}
 	waitForCondition(t, "session to become inactive", func() bool { return !session.IsAlive() })
-	if disconnects.Load() == 0 {
-		t.Fatal("expected disconnect event during shutdown")
-	}
+	waitForCondition(t, "disconnect event during shutdown", func() bool { return disconnects.Load() > 0 })
 	if err := sm.EmitTo(session.GetUUID(), []byte("nope")); !errors.Is(err, ErrorShutdown) {
 		t.Fatalf("EmitTo after shutdown got %v, want %v", err, ErrorShutdown)
 	}

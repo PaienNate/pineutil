@@ -173,9 +173,10 @@ token := kws.GetRequestHeader("Authorization")
 
 ### `OnConnected` / `OnDisconnected`
 
-- `OnConnected` 会在 transport 建立完成后触发
-- `OnDisconnected` 会在当前 transport 断开后触发
+- `OnConnected` 会在 transport 建立完成后异步触发（脱离网络读循环），可以在里面做 request-response 等阻塞操作
+- `OnDisconnected` 会在当前 transport 断开后异步触发
 - 如果你要不要重连，请在 `OnDisconnected` 后由自己的状态机决定是否调用 `Reconnect()`
+- 服务端的 `New(callback)` 仅用于同步初始化（设置 UUID、属性、绑定回调），**不应在 `callback` 内等待后续消息**
 
 ## 六、heartbeat 配置说明
 

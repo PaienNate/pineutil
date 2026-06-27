@@ -103,6 +103,12 @@ type EventPayload struct {
 	Data             []byte
 }
 
+type eventEnvelope struct {
+	payload   *EventPayload
+	callbacks []eventCallback
+	opcode    gws.Opcode
+}
+
 type eventCallback func(payload *EventPayload)
 
 type safeListeners struct {
@@ -332,6 +338,9 @@ type WebsocketWrapper struct {
 	clientState   clientTransportState
 	heartbeatStop chan struct{}
 	heartbeatConn *gws.Conn
+	eventMu       sync.Mutex
+	eventQueue    []eventEnvelope
+	eventDraining bool
 
 	OnConnected    func()
 	OnDisconnected func(err error)
@@ -415,6 +424,93 @@ func (kws *WebsocketWrapper) onPong(payload string) {
 	kws.mu.RUnlock()
 	if cb != nil {
 		cb(payload)
+	}
+}
+
+func (kws *WebsocketWrapper) dispatchEvent(event string, data []byte, eventErr error) {
+	payload := kws.newEventPayload(event, data, eventErr)
+	callbacks := kws.manager.listeners.get(event)
+	if kws.shouldQueueEvent(event) {
+		kws.enqueueEvent(eventEnvelope{payload: payload, callbacks: callbacks})
+		return
+	}
+	go kws.invokeEventCallbacks(eventEnvelope{payload: payload, callbacks: callbacks})
+}
+
+func (kws *WebsocketWrapper) dispatchMessage(opcode gws.Opcode, data []byte) {
+	payload := kws.newEventPayload(EventMessage, data, nil)
+	callbacks := kws.manager.listeners.get(EventMessage)
+	kws.enqueueEvent(eventEnvelope{payload: payload, callbacks: callbacks, opcode: opcode})
+}
+
+func (kws *WebsocketWrapper) shouldQueueEvent(event string) bool {
+	switch event {
+	case EventMessage, EventPing, EventPong, EventDisconnect, EventError, EventClose:
+		return true
+	default:
+		return false
+	}
+}
+
+func (kws *WebsocketWrapper) enqueueEvent(event eventEnvelope) {
+	kws.eventMu.Lock()
+	kws.eventQueue = append(kws.eventQueue, event)
+	if kws.eventDraining {
+		kws.eventMu.Unlock()
+		return
+	}
+	kws.eventDraining = true
+	kws.eventMu.Unlock()
+	go kws.drainEvents()
+}
+
+func (kws *WebsocketWrapper) drainEvents() {
+	for {
+		kws.eventMu.Lock()
+		if len(kws.eventQueue) == 0 {
+			kws.eventDraining = false
+			kws.eventMu.Unlock()
+			return
+		}
+		event := kws.eventQueue[0]
+		kws.eventQueue = kws.eventQueue[1:]
+		kws.eventMu.Unlock()
+		kws.invokeEventCallbacks(event)
+	}
+}
+
+func (kws *WebsocketWrapper) invokeEventCallbacks(event eventEnvelope) {
+	switch event.payload.Name {
+	case EventConnect:
+		kws.onConnected()
+	case EventDisconnect:
+		kws.onDisconnected(event.payload.Error)
+	case EventMessage:
+		switch event.opcode {
+		case gws.OpcodeBinary:
+			kws.onBinaryMessage(event.payload.Data)
+		default:
+			kws.onTextMessage(string(event.payload.Data))
+		}
+	case EventPing:
+		kws.onPing(string(event.payload.Data))
+	case EventPong:
+		kws.onPong(string(event.payload.Data))
+	}
+	for _, callback := range event.callbacks {
+		callback(event.payload)
+	}
+}
+
+func (kws *WebsocketWrapper) newEventPayload(event string, data []byte, eventErr error) *EventPayload {
+	attrs := kws.snapshotAttributes()
+	return &EventPayload{
+		Kws:              kws,
+		Name:             event,
+		SocketUUID:       kws.GetUUID(),
+		SocketAttributes: attrs,
+		Error:            eventErr,
+		Data:             append([]byte(nil), data...),
 	}
 }
 
@@ -701,9 +797,9 @@ func (kws *WebsocketWrapper) connectClientTransport(reconnecting bool) error {
 	clientOption.NewSession = func() gws.SessionStorage { return gws.NewConcurrentMap[string, any]() }
 	socket, _, err := gws.NewClient(handler, clientOption)
 	if err != nil {
-		kws.onConnectError(err)
+		go kws.onConnectError(err)
 		if !reconnecting && !kws.connectedOnce.Load() {
-			kws.onConnectFailed(err)
+			go kws.onConnectFailed(err)
 		}
 		return err
 	}
@@ -793,10 +889,9 @@ func (kws *WebsocketWrapper) finalizeTransportClose(socket *gws.Conn, err error)
 	}
 	kws.stateMu.Unlock()
 	kws.manager.pool.delete(kws.GetUUID())
-	kws.fireEvent(EventDisconnect, nil, err)
-	kws.onDisconnected(err)
+	kws.dispatchEvent(EventDisconnect, nil, err)
 	if err != nil {
-		kws.fireEvent(EventError, nil, err)
+		kws.dispatchEvent(EventError, nil, err)
 	}
 	return true
 }
@@ -855,34 +950,25 @@ func (h *transportHandler) OnOpen(socket *gws.Conn) {
 	if h.onOpen != nil {
 		h.onOpen(wrapper)
 	}
-	wrapper.onConnected()
-	wrapper.fireEvent(EventConnect, nil, nil)
+	wrapper.dispatchEvent(EventConnect, nil, nil)
 }
 
 func (h *transportHandler) OnMessage(socket *gws.Conn, message *gws.Message) {
 	defer message.Close()
 	h.wrapper.refreshClientDeadline(socket)
 	data := append([]byte(nil), message.Bytes()...)
-	switch message.Opcode {
-	case gws.OpcodeText:
-		h.wrapper.onTextMessage(string(data))
-	case gws.OpcodeBinary:
-		h.wrapper.onBinaryMessage(data)
-	}
-	h.wrapper.fireEvent(EventMessage, data, nil)
+	h.wrapper.dispatchMessage(message.Opcode, data)
 }
 
 func (h *transportHandler) OnPing(socket *gws.Conn, payload []byte) {
 	h.wrapper.refreshClientDeadline(socket)
-	h.wrapper.onPing(string(payload))
-	h.wrapper.fireEvent(EventPing, payload, nil)
+	h.wrapper.dispatchEvent(EventPing, payload, nil)
 	_ = socket.WritePong(payload)
 }
 
 func (h *transportHandler) OnPong(socket *gws.Conn, payload []byte) {
 	h.wrapper.refreshClientDeadline(socket)
-	h.wrapper.onPong(string(payload))
-	h.wrapper.fireEvent(EventPong, payload, nil)
+	h.wrapper.dispatchEvent(EventPong, payload, nil)
 }
 
 func (h *transportHandler) OnClose(socket *gws.Conn, err error) {
@@ -913,3 +999,4 @@ func cloneServerOption(option *gws.ServerOption) *gws.ServerOption {
 	}
 	return &clone
 }
+
